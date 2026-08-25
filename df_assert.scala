@@ -531,6 +531,56 @@ object DataFrameAssertions {
 
   /**
    * Compares two Float/Double values using the supplied strategy.
+   *
+   * NULL, NaN and Infinity are handled before the comparison strategy:
+   *
+   * null == null
+   * NaN == NaN
+   * +Infinity == +Infinity
+   * -Infinity == -Infinity
+   */
+  private def floatValuesEqual(
+      actValue: Any,
+      expValue: Any,
+      comparison: FloatComparison
+  ): Boolean = {
+
+    (actValue, expValue) match {
+
+      case (null, null) =>
+        true
+
+      case (null, _) | (_, null) =>
+        false
+
+      case (act: Number, exp: Number) =>
+        val actual =
+          act.doubleValue()
+
+        val expected =
+          exp.doubleValue()
+
+        if (actual.isNaN || expected.isNaN) {
+          actual.isNaN && expected.isNaN
+        } else if (actual.isInfinity || expected.isInfinity) {
+          actual == expected
+        } else {
+          comparison.isEqual(
+            actual,
+            expected
+          )
+        }
+
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Non-numeric values encountered: actual=$actValue, expected=$expValue"
+        )
+    }
+  }
+
+
+  /**
+   * Asserts two Float/Double values using the supplied strategy.
    */
   private def assertFloatValueEquals(
       actValue: Any,
@@ -541,26 +591,11 @@ object DataFrameAssertions {
   ): Unit = {
 
     val equal =
-      (actValue, expValue) match {
-
-        case (null, null) =>
-          true
-
-        case (null, _) | (_, null) =>
-          false
-
-        case (act: Number, exp: Number) =>
-          comparison.isEqual(
-            act.doubleValue(),
-            exp.doubleValue()
-          )
-
-        case _ =>
-          throw new IllegalArgumentException(
-            s"Column '$column' contains non-numeric values: " +
-              s"actual=$actValue, expected=$expValue"
-          )
-      }
+      floatValuesEqual(
+        actValue = actValue,
+        expValue = expValue,
+        comparison = comparison
+      )
 
     assert(
       equal,
@@ -600,26 +635,11 @@ object DataFrameAssertions {
         val expValue =
           row.getAs[Any]("expected")
 
-        (actValue, expValue) match {
-
-          case (null, null) =>
-            false
-
-          case (null, _) | (_, null) =>
-            true
-
-          case (act: Number, exp: Number) =>
-            !comparison.isEqual(
-              act.doubleValue(),
-              exp.doubleValue()
-            )
-
-          case _ =>
-            throw new IllegalArgumentException(
-              s"Non-numeric values encountered: " +
-                s"actual=$actValue, expected=$expValue"
-            )
-        }
+        !floatValuesEqual(
+          actValue = actValue,
+          expValue = expValue,
+          comparison = comparison
+        )
       }
       .toLong
   }
