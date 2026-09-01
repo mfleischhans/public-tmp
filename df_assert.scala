@@ -1,4 +1,4 @@
-import org.apache.spark.sql.{Column, DataFrame, Row}
+import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions._
 
 import scala.collection.mutable.ArrayBuffer
@@ -134,7 +134,6 @@ object FloatComparison {
 object DataFrameAssertions {
 
   private val MaxReportedMismatches = 20
-
   private val ReportWidth = 80
 
   private val FullSeparator =
@@ -187,15 +186,14 @@ object DataFrameAssertions {
 
     require(sortCols.nonEmpty, "sortCols must not be empty")
 
-    val relevantCols =
-      (sortCols ++ exactMatchCols ++ floatComparisons.keys).distinct
-
     assertNoColumnOverlap(
-      sortCols = sortCols,
       businessKeyCols = Seq.empty,
       exactMatchCols = exactMatchCols,
       floatComparisons = floatComparisons
     )
+
+    val relevantCols =
+      (sortCols ++ exactMatchCols ++ floatComparisons.keys).distinct
 
     assertColumnSchemasEqual(
       actDf,
@@ -253,7 +251,7 @@ object DataFrameAssertions {
 
       assert(
         assertion = false,
-        clue = "Different row count"
+        message = "Different row count"
       )
     }
 
@@ -270,7 +268,6 @@ object DataFrameAssertions {
     println("Exact-match comparison...")
 
     var exactFailure: Option[(Int, Row, Row)] = None
-
     var rowIndex = 0
 
     while (rowIndex < actSorted.length && exactFailure.isEmpty) {
@@ -325,7 +322,7 @@ object DataFrameAssertions {
 
         assert(
           assertion = false,
-          clue = s"Exact-match comparison failed at row $index"
+          message = s"Exact-match comparison failed at row $index"
         )
 
       case None =>
@@ -405,7 +402,7 @@ object DataFrameAssertions {
 
         assert(
           assertion = false,
-          clue = s"Float/Double comparison failed at row $index"
+          message = s"Float/Double comparison failed at row $index"
         )
 
       case None =>
@@ -462,8 +459,8 @@ object DataFrameAssertions {
    * CSV-like diff for the first mismatching row in the failing stage. Remaining
    * stages are reported as NOT EXECUTED.
    *
-   * Business-key columns define row identity and are therefore intentionally
-   * separate from exactMatchCols, even though both use exact equality.
+   * Business-key columns define row identity and are intentionally separate from
+   * exactMatchCols, even though both use exact equality.
    *
    * Business keys must be non-null and unique within each DataFrame.
    *
@@ -493,7 +490,6 @@ object DataFrameAssertions {
     )
 
     assertNoColumnOverlap(
-      sortCols = Seq.empty,
       businessKeyCols = businessKeyCols,
       exactMatchCols = exactMatchCols,
       floatComparisons = floatComparisons
@@ -549,21 +545,27 @@ object DataFrameAssertions {
     val sections =
       ArrayBuffer.empty[ReportSection]
 
+    // Prefix all relevant columns before the join so collected Row objects
+    // have unambiguous field names.
     val act =
-      actDf
-        .select(relevantCols.map(col): _*)
-        .alias("act")
+      actDf.select(
+        relevantCols.map { column =>
+          col(column).alias(actColumn(column))
+        }: _*
+      )
 
     val exp =
-      expDf
-        .select(relevantCols.map(col): _*)
-        .alias("exp")
+      expDf.select(
+        relevantCols.map { column =>
+          col(column).alias(expColumn(column))
+        }: _*
+      )
 
     val joinCondition =
       businessKeyCols
-        .map(column =>
-          col(s"act.$column") <=> col(s"exp.$column")
-        )
+        .map { column =>
+          col(actColumn(column)) <=> col(expColumn(column))
+        }
         .reduce(_ && _)
 
     val joined =
@@ -575,12 +577,12 @@ object DataFrameAssertions {
 
     val actMissing =
       businessKeyCols
-        .map(column => col(s"act.$column").isNull)
+        .map(column => col(actColumn(column)).isNull)
         .reduce(_ && _)
 
     val expMissing =
       businessKeyCols
-        .map(column => col(s"exp.$column").isNull)
+        .map(column => col(expColumn(column)).isNull)
         .reduce(_ && _)
 
     val extraRowsInActual =
@@ -597,6 +599,7 @@ object DataFrameAssertions {
       joined.filter(
         !actMissing && !expMissing
       )
+
 
     // -------------------------------------------------------------------------
     // Business-key matching
@@ -624,7 +627,7 @@ object DataFrameAssertions {
         val firstExtra =
           extraRowsInActual
             .orderBy(
-              businessKeyCols.map(c => col(s"act.$c")): _*
+              businessKeyCols.map(c => col(actColumn(c))): _*
             )
             .limit(1)
             .collect()
@@ -633,7 +636,7 @@ object DataFrameAssertions {
         val firstMissing =
           missingRowsInActual
             .orderBy(
-              businessKeyCols.map(c => col(s"exp.$c")): _*
+              businessKeyCols.map(c => col(expColumn(c))): _*
             )
             .limit(1)
             .collect()
@@ -650,7 +653,7 @@ object DataFrameAssertions {
               ) ++
                 formatJoinedSingleRow(
                   row = row,
-                  sourceAlias = "act",
+                  actualSide = true,
                   sourceLabel = "ACTUAL",
                   columns = relevantCols
                 )
@@ -666,7 +669,7 @@ object DataFrameAssertions {
                   ) ++
                     formatJoinedSingleRow(
                       row = row,
-                      sourceAlias = "exp",
+                      actualSide = false,
                       sourceLabel = "EXPECTED",
                       columns = relevantCols
                     )
@@ -701,7 +704,7 @@ object DataFrameAssertions {
 
         assert(
           assertion = false,
-          clue = "Business-key matching failed"
+          message = "Business-key matching failed"
         )
       }
 
@@ -713,12 +716,15 @@ object DataFrameAssertions {
         )
 
       if (extraInActualCount > 0) {
+
         lines += ""
-        lines += s"First ${math.min(extraInActualCount, MaxReportedMismatches)} extra rows in actual:"
+        lines +=
+          s"First ${math.min(extraInActualCount, MaxReportedMismatches)} extra rows in actual:"
+
         lines ++=
           formatJoinedRows(
             df = extraRowsInActual,
-            sourceAlias = "act",
+            actualSide = true,
             sourceLabel = "ACTUAL",
             columns = relevantCols,
             limit = MaxReportedMismatches
@@ -731,12 +737,15 @@ object DataFrameAssertions {
       }
 
       if (missingInActualCount > 0) {
+
         lines += ""
-        lines += s"First ${math.min(missingInActualCount, MaxReportedMismatches)} missing rows in actual:"
+        lines +=
+          s"First ${math.min(missingInActualCount, MaxReportedMismatches)} missing rows in actual:"
+
         lines ++=
           formatJoinedRows(
             df = missingRowsInActual,
-            sourceAlias = "exp",
+            actualSide = false,
             sourceLabel = "EXPECTED",
             columns = relevantCols,
             limit = MaxReportedMismatches
@@ -755,6 +764,7 @@ object DataFrameAssertions {
       )
 
       println("Business-key matching... FAILED")
+
     } else {
 
       sections += ReportSection(
@@ -770,6 +780,7 @@ object DataFrameAssertions {
       println("Business-key matching... OK")
     }
 
+
     // -------------------------------------------------------------------------
     // Exact-match comparison
     // -------------------------------------------------------------------------
@@ -780,9 +791,9 @@ object DataFrameAssertions {
 
       val exactMismatchCondition =
         exactMatchCols
-          .map(column =>
-            !(col(s"act.$column") <=> col(s"exp.$column"))
-          )
+          .map { column =>
+            !(col(actColumn(column)) <=> col(expColumn(column)))
+          }
           .reduceOption(_ || _)
           .getOrElse(lit(false))
 
@@ -790,7 +801,7 @@ object DataFrameAssertions {
         matchedRows
           .filter(exactMismatchCondition)
           .orderBy(
-            businessKeyCols.map(c => col(s"act.$c")): _*
+            businessKeyCols.map(c => col(actColumn(c))): _*
           )
           .limit(1)
           .collect()
@@ -826,7 +837,7 @@ object DataFrameAssertions {
 
           assert(
             assertion = false,
-            clue = "Exact-match comparison failed"
+            message = "Exact-match comparison failed"
           )
 
         case None =>
@@ -842,6 +853,7 @@ object DataFrameAssertions {
 
           println("Exact-match comparison... OK")
       }
+
     } else {
 
       val exactLines =
@@ -856,7 +868,7 @@ object DataFrameAssertions {
 
         val mismatches =
           matchedRows.filter(
-            !(col(s"act.$column") <=> col(s"exp.$column"))
+            !(col(actColumn(column)) <=> col(expColumn(column)))
           )
 
         val mismatchCount =
@@ -901,6 +913,7 @@ object DataFrameAssertions {
           "Exact-match comparison... OK"
       )
     }
+
 
     // -------------------------------------------------------------------------
     // Float/Double comparison
@@ -948,7 +961,8 @@ object DataFrameAssertions {
 
           assert(
             assertion = false,
-            clue = s"Float/Double comparison failed for column '$column'"
+            message =
+              s"Float/Double comparison failed for column '$column'"
           )
 
         case None =>
@@ -1029,6 +1043,11 @@ object DataFrameAssertions {
       )
     }
 
+
+    // -------------------------------------------------------------------------
+    // Final report
+    // -------------------------------------------------------------------------
+
     val report =
       DataFrameAssertionReport(
         configuration = configuration,
@@ -1039,7 +1058,7 @@ object DataFrameAssertions {
 
     assert(
       assertion = report.passed,
-      clue = "DataFrame comparison failed"
+      message = "DataFrame comparison failed"
     )
   }
 
@@ -1080,6 +1099,22 @@ object DataFrameAssertions {
     def passed: Boolean =
       !sections.exists(_.status == Failed)
   }
+
+
+  // ===========================================================================
+  // Column naming
+  // ===========================================================================
+
+  private def actColumn(
+      column: String
+  ): String =
+    s"act__$column"
+
+
+  private def expColumn(
+      column: String
+  ): String =
+    s"exp__$column"
 
 
   // ===========================================================================
@@ -1135,7 +1170,6 @@ object DataFrameAssertions {
 
 
   private def assertNoColumnOverlap(
-      sortCols: Seq[String],
       businessKeyCols: Seq[String],
       exactMatchCols: Seq[String],
       floatComparisons: Map[String, FloatComparison]
@@ -1273,7 +1307,8 @@ object DataFrameAssertions {
 
       case _ =>
         throw new IllegalArgumentException(
-          s"Non-numeric values encountered: actual=$actValue, expected=$expValue"
+          s"Non-numeric values encountered: " +
+            s"actual=$actValue, expected=$expValue"
         )
     }
   }
@@ -1281,9 +1316,6 @@ object DataFrameAssertions {
 
   /**
    * Filters Float/Double mismatches for a single matched column.
-   *
-   * The comparison itself is evaluated by a UDF so the DataFrame can still be
-   * filtered before mismatch samples are collected on the driver.
    */
   private def filterFloatMismatches(
       df: DataFrame,
@@ -1304,8 +1336,8 @@ object DataFrameAssertions {
 
     df.filter(
       !isEqualUdf(
-        col(s"act.$columnName").cast("double"),
-        col(s"exp.$columnName").cast("double")
+        col(actColumn(columnName)).cast("double"),
+        col(expColumn(columnName)).cast("double")
       )
     )
   }
@@ -1328,19 +1360,19 @@ object DataFrameAssertions {
               comparison = comparison
             )
               .orderBy(
-                businessKeyCols.map(c => col(s"act.$c")): _*
+                businessKeyCols.map(c => col(actColumn(c))): _*
               )
               .limit(1)
               .collect()
               .headOption
 
-          row.map(r =>
+          row.map { value =>
             (
               column,
               comparison,
-              r
+              value
             )
-          )
+          }
       }
       .collectFirst {
         case Some(value) => value
@@ -1355,8 +1387,10 @@ object DataFrameAssertions {
   private def formatCsvValue(
       value: Any
   ): String =
-    if (value == null) "null"
-    else value.toString
+    if (value == null)
+      "null"
+    else
+      value.toString
 
 
   private def formatRowDiff(
@@ -1372,21 +1406,21 @@ object DataFrameAssertions {
     val actLine =
       (
         "ACTUAL" +:
-          columns.map(column =>
+          columns.map { column =>
             formatCsvValue(
               actRow.getAs[Any](column)
             )
-          )
+          }
       ).mkString(",")
 
     val expLine =
       (
         "EXPECTED" +:
-          columns.map(column =>
+          columns.map { column =>
             formatCsvValue(
               expRow.getAs[Any](column)
             )
-          )
+          }
       ).mkString(",")
 
     Seq(
@@ -1409,18 +1443,14 @@ object DataFrameAssertions {
     val actualValues =
       columns.map { column =>
         formatCsvValue(
-          row.getAs[Any](
-            row.fieldIndex(s"act.$column")
-          )
+          row.getAs[Any](actColumn(column))
         )
       }
 
     val expectedValues =
       columns.map { column =>
         formatCsvValue(
-          row.getAs[Any](
-            row.fieldIndex(s"exp.$column")
-          )
+          row.getAs[Any](expColumn(column))
         )
       }
 
@@ -1434,7 +1464,7 @@ object DataFrameAssertions {
 
   private def formatJoinedSingleRow(
       row: Row,
-      sourceAlias: String,
+      actualSide: Boolean,
       sourceLabel: String,
       columns: Seq[String]
   ): Seq[String] = {
@@ -1445,10 +1475,15 @@ object DataFrameAssertions {
 
     val values =
       columns.map { column =>
+
+        val fieldName =
+          if (actualSide)
+            actColumn(column)
+          else
+            expColumn(column)
+
         formatCsvValue(
-          row.getAs[Any](
-            row.fieldIndex(s"$sourceAlias.$column")
-          )
+          row.getAs[Any](fieldName)
         )
       }
 
@@ -1461,7 +1496,7 @@ object DataFrameAssertions {
 
   private def formatJoinedRows(
       df: DataFrame,
-      sourceAlias: String,
+      actualSide: Boolean,
       sourceLabel: String,
       columns: Seq[String],
       limit: Int
@@ -1473,8 +1508,11 @@ object DataFrameAssertions {
         .collect()
 
     if (rows.isEmpty) {
+
       Seq.empty
+
     } else {
+
       val header =
         ("_source" +: columns)
           .mkString(",")
@@ -1484,15 +1522,21 @@ object DataFrameAssertions {
 
           val values =
             columns.map { column =>
+
+              val fieldName =
+                if (actualSide)
+                  actColumn(column)
+                else
+                  expColumn(column)
+
               formatCsvValue(
-                row.getAs[Any](
-                  row.fieldIndex(s"$sourceAlias.$column")
-                )
+                row.getAs[Any](fieldName)
               )
             }
 
           (sourceLabel +: values)
             .mkString(",")
+
         }.toSeq
     }
   }
@@ -1510,7 +1554,9 @@ object DataFrameAssertions {
         .collect()
 
     if (rows.isEmpty) {
+
       Seq.empty
+
     } else {
 
       val header =
@@ -1525,18 +1571,14 @@ object DataFrameAssertions {
         val actualValues =
           columns.map { column =>
             formatCsvValue(
-              row.getAs[Any](
-                row.fieldIndex(s"act.$column")
-              )
+              row.getAs[Any](actColumn(column))
             )
           }
 
         val expectedValues =
           columns.map { column =>
             formatCsvValue(
-              row.getAs[Any](
-                row.fieldIndex(s"exp.$column")
-              )
+              row.getAs[Any](expColumn(column))
             )
           }
 
@@ -1564,7 +1606,7 @@ object DataFrameAssertions {
 
     println()
     println(FullSeparator)
-    println(center("| DATAFRAME ASSERTION REPORT |"))
+    println(center("DATAFRAME ASSERTION REPORT"))
     println(FullSeparator)
     println()
 
@@ -1579,7 +1621,6 @@ object DataFrameAssertions {
     }
 
     println()
-
     println("Test results:")
 
     report.sections.foreach { section =>
@@ -1640,8 +1681,11 @@ object DataFrameAssertions {
   ): String = {
 
     if (comparisons.isEmpty) {
+
       "[]"
+
     } else {
+
       comparisons
         .map {
           case (column, comparison) =>
@@ -1657,8 +1701,11 @@ object DataFrameAssertions {
   ): String = {
 
     if (comparisons.isEmpty) {
+
       "  none"
+
     } else {
+
       comparisons
         .map {
           case (column, comparison) =>
@@ -1673,14 +1720,14 @@ object DataFrameAssertions {
       text: String
   ): String = {
 
-    val content =
-      text.stripPrefix("|").stripSuffix("|").trim
-
     val innerWidth =
       ReportWidth - 2
 
     val totalPadding =
-      math.max(0, innerWidth - content.length)
+      math.max(
+        0,
+        innerWidth - text.length
+      )
 
     val left =
       totalPadding / 2
@@ -1690,7 +1737,7 @@ object DataFrameAssertions {
 
     "|" +
       (" " * left) +
-      content +
+      text +
       (" " * right) +
       "|"
   }
