@@ -1,5 +1,6 @@
 import org.apache.spark.sql.{DataFrame, Row}
 import org.apache.spark.sql.functions._
+import org.apache.spark.storage.StorageLevel
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -464,6 +465,10 @@ object DataFrameAssertions {
    *
    * Business keys must be non-null and unique within each DataFrame.
    *
+   * Relevant actual and expected data are persisted before validation and the
+   * joined DataFrame is persisted before comparison to avoid repeated execution
+   * of the upstream transformation and join across multiple Spark actions.
+   *
    * A final test report containing the assertion configuration and execution
    * results is always printed.
    *
@@ -508,191 +513,579 @@ object DataFrameAssertions {
       relevantCols
     )
 
-    assertBusinessKeyNotNull(
-      actDf,
-      businessKeyCols,
-      "Actual DataFrame"
-    )
+    /*
+     * Persist only the columns relevant for the assertion.
+     *
+     * This prevents repeated execution of the upstream ACT transformation and
+     * EXP input lineage during business-key validation and join construction.
+     */
+    val relevantAct =
+      actDf
+        .select(relevantCols.map(col): _*)
+        .persist(StorageLevel.MEMORY_ONLY)
 
-    assertBusinessKeyNotNull(
-      expDf,
-      businessKeyCols,
-      "Expected DataFrame"
-    )
+    val relevantExp =
+      expDf
+        .select(relevantCols.map(col): _*)
+        .persist(StorageLevel.MEMORY_ONLY)
 
-    assertBusinessKeyUnique(
-      actDf,
-      businessKeyCols,
-      "Actual DataFrame"
-    )
+    try {
 
-    assertBusinessKeyUnique(
-      expDf,
-      businessKeyCols,
-      "Expected DataFrame"
-    )
+      // Materialize ACT and EXP caches
+      relevantAct.count()
+      relevantExp.count()
 
-    val configuration =
-      Seq(
-        "Assertion" -> "Business-key DataFrame assertion",
-        "Execution mode" -> (if (failFast) "Fail-fast" else "Full summary"),
-        "Business keys" -> formatSeq(businessKeyCols),
-        "Exact-match columns" -> formatSeq(exactMatchCols),
-        "Float comparisons" -> formatFloatComparisons(floatComparisons),
-        "Fail fast" -> failFast.toString
+      assertBusinessKeyNotNull(
+        relevantAct,
+        businessKeyCols,
+        "Actual DataFrame"
       )
 
-    val sections =
-      ArrayBuffer.empty[ReportSection]
-
-    // Prefix all relevant columns before the join so collected Row objects
-    // have unambiguous field names.
-    val act =
-      actDf.select(
-        relevantCols.map { column =>
-          col(column).alias(actColumn(column))
-        }: _*
+      assertBusinessKeyNotNull(
+        relevantExp,
+        businessKeyCols,
+        "Expected DataFrame"
       )
 
-    val exp =
-      expDf.select(
-        relevantCols.map { column =>
-          col(column).alias(expColumn(column))
-        }: _*
+      assertBusinessKeyUnique(
+        relevantAct,
+        businessKeyCols,
+        "Actual DataFrame"
       )
 
-    val joinCondition =
-      businessKeyCols
-        .map { column =>
-          col(actColumn(column)) <=> col(expColumn(column))
-        }
-        .reduce(_ && _)
-
-    val joined =
-      act.join(
-        exp,
-        joinCondition,
-        "full_outer"
+      assertBusinessKeyUnique(
+        relevantExp,
+        businessKeyCols,
+        "Expected DataFrame"
       )
 
-    val actMissing =
-      businessKeyCols
-        .map(column => col(actColumn(column)).isNull)
-        .reduce(_ && _)
+      val configuration =
+        Seq(
+          "Assertion" -> "Business-key DataFrame assertion",
+          "Execution mode" -> (if (failFast) "Fail-fast" else "Full summary"),
+          "Business keys" -> formatSeq(businessKeyCols),
+          "Exact-match columns" -> formatSeq(exactMatchCols),
+          "Float comparisons" -> formatFloatComparisons(floatComparisons)
+        )
 
-    val expMissing =
-      businessKeyCols
-        .map(column => col(expColumn(column)).isNull)
-        .reduce(_ && _)
+      val sections =
+        ArrayBuffer.empty[ReportSection]
 
-    val extraRowsInActual =
-      joined.filter(
-        expMissing && !actMissing
-      )
+      // Prefix all columns before the join so collected Row objects have
+      // unambiguous field names.
+      val act =
+        relevantAct.select(
+          relevantCols.map { column =>
+            col(column).alias(actColumn(column))
+          }: _*
+        )
 
-    val missingRowsInActual =
-      joined.filter(
-        actMissing && !expMissing
-      )
+      val exp =
+        relevantExp.select(
+          relevantCols.map { column =>
+            col(column).alias(expColumn(column))
+          }: _*
+        )
 
-    val matchedRows =
-      joined.filter(
-        !actMissing && !expMissing
-      )
+      val joinCondition =
+        businessKeyCols
+          .map { column =>
+            col(actColumn(column)) <=> col(expColumn(column))
+          }
+          .reduce(_ && _)
+
+      /*
+       * Persist the full joined dataset once.
+       *
+       * All subsequent unmatched-row checks, exact comparisons, float
+       * comparisons, counts and sample retrievals are derived from this cache.
+       */
+      val joined =
+        act
+          .join(
+            exp,
+            joinCondition,
+            "full_outer"
+          )
+          .persist(StorageLevel.MEMORY_ONLY)
+
+      try {
+
+        // Materialize joined cache
+        joined.count()
+
+        val actMissing =
+          businessKeyCols
+            .map(column => col(actColumn(column)).isNull)
+            .reduce(_ && _)
+
+        val expMissing =
+          businessKeyCols
+            .map(column => col(expColumn(column)).isNull)
+            .reduce(_ && _)
+
+        val extraRowsInActual =
+          joined.filter(
+            expMissing && !actMissing
+          )
+
+        val missingRowsInActual =
+          joined.filter(
+            actMissing && !expMissing
+          )
+
+        val matchedRows =
+          joined.filter(
+            !actMissing && !expMissing
+          )
 
 
-    // -------------------------------------------------------------------------
-    // Business-key matching
-    // -------------------------------------------------------------------------
+        // ---------------------------------------------------------------------
+        // Business-key matching
+        // ---------------------------------------------------------------------
 
-    println("Business-key matching...")
+        println("Business-key matching...")
 
-    val extraInActualCount =
-      extraRowsInActual.count()
+        val extraInActualCount =
+          extraRowsInActual.count()
 
-    val missingInActualCount =
-      missingRowsInActual.count()
+        val missingInActualCount =
+          missingRowsInActual.count()
 
-    val matchedRowCount =
-      matchedRows.count()
+        val matchedRowCount =
+          matchedRows.count()
 
-    val businessKeyFailed =
-      extraInActualCount > 0 ||
-        missingInActualCount > 0
+        val businessKeyFailed =
+          extraInActualCount > 0 ||
+            missingInActualCount > 0
 
-    if (businessKeyFailed) {
+        if (businessKeyFailed) {
 
-      if (failFast) {
+          if (failFast) {
 
-        val firstExtra =
-          extraRowsInActual
-            .orderBy(
-              businessKeyCols.map(c => col(actColumn(c))): _*
-            )
-            .limit(1)
-            .collect()
-            .headOption
-
-        val firstMissing =
-          missingRowsInActual
-            .orderBy(
-              businessKeyCols.map(c => col(expColumn(c))): _*
-            )
-            .limit(1)
-            .collect()
-            .headOption
-
-        val detailLines =
-          firstExtra match {
-
-            case Some(row) =>
-              Seq(
-                "First unmatched row:",
-                "Location: ACTUAL only",
-                ""
-              ) ++
-                formatJoinedSingleRow(
-                  row = row,
-                  actualSide = true,
-                  sourceLabel = "ACTUAL",
-                  columns = relevantCols
+            val firstExtra =
+              extraRowsInActual
+                .orderBy(
+                  businessKeyCols.map(c => col(actColumn(c))): _*
                 )
+                .limit(1)
+                .collect()
+                .headOption
 
-            case None =>
-              firstMissing match {
+            val firstMissing =
+              missingRowsInActual
+                .orderBy(
+                  businessKeyCols.map(c => col(expColumn(c))): _*
+                )
+                .limit(1)
+                .collect()
+                .headOption
+
+            val detailLines =
+              firstExtra match {
 
                 case Some(row) =>
                   Seq(
                     "First unmatched row:",
-                    "Location: EXPECTED only",
+                    "Location: ACT only",
                     ""
                   ) ++
                     formatJoinedSingleRow(
                       row = row,
-                      actualSide = false,
-                      sourceLabel = "EXPECTED",
+                      actualSide = true,
+                      sourceLabel = "ACT",
                       columns = relevantCols
                     )
 
                 case None =>
-                  Seq.empty
+                  firstMissing match {
+
+                    case Some(row) =>
+                      Seq(
+                        "First unmatched row:",
+                        "Location: EXP only",
+                        ""
+                      ) ++
+                        formatJoinedSingleRow(
+                          row = row,
+                          actualSide = false,
+                          sourceLabel = "EXP",
+                          columns = relevantCols
+                        )
+
+                    case None =>
+                      Seq.empty
+                  }
+              }
+
+            sections += ReportSection(
+              title = "Business-key matching",
+              status = Failed,
+              lines =
+                Seq(
+                  s"Matched rows:            $matchedRowCount",
+                  s"Extra rows in actual:    $extraInActualCount",
+                  s"Missing rows in actual:  $missingInActualCount",
+                  ""
+                ) ++ detailLines
+            )
+
+            sections += notExecutedSection("Exact-match comparison")
+            sections += notExecutedSection("Float/Double comparison")
+
+            val report =
+              DataFrameAssertionReport(
+                configuration = configuration,
+                sections = sections.toSeq
+              )
+
+            printReport(report)
+
+            assert(
+              assertion = false,
+              message = "Business-key matching failed"
+            )
+          }
+
+          val lines =
+            ArrayBuffer[String](
+              s"Matched rows:            $matchedRowCount",
+              s"Extra rows in actual:    $extraInActualCount",
+              s"Missing rows in actual:  $missingInActualCount"
+            )
+
+          if (extraInActualCount > 0) {
+
+            lines += ""
+            lines +=
+              s"First ${math.min(extraInActualCount, MaxReportedMismatches)} extra rows in actual:"
+
+            lines ++=
+              formatJoinedRows(
+                df = extraRowsInActual,
+                actualSide = true,
+                sourceLabel = "ACT",
+                columns = relevantCols,
+                limit = MaxReportedMismatches
+              )
+
+            if (extraInActualCount > MaxReportedMismatches) {
+              lines +=
+                s"... ${extraInActualCount - MaxReportedMismatches} additional rows not shown"
+            }
+          }
+
+          if (missingInActualCount > 0) {
+
+            lines += ""
+            lines +=
+              s"First ${math.min(missingInActualCount, MaxReportedMismatches)} missing rows in actual:"
+
+            lines ++=
+              formatJoinedRows(
+                df = missingRowsInActual,
+                actualSide = false,
+                sourceLabel = "EXP",
+                columns = relevantCols,
+                limit = MaxReportedMismatches
+              )
+
+            if (missingInActualCount > MaxReportedMismatches) {
+              lines +=
+                s"... ${missingInActualCount - MaxReportedMismatches} additional rows not shown"
+            }
+          }
+
+          sections += ReportSection(
+            title = "Business-key matching",
+            status = Failed,
+            lines = lines.toSeq
+          )
+
+          println("Business-key matching... FAILED")
+
+        } else {
+
+          sections += ReportSection(
+            title = "Business-key matching",
+            status = Passed,
+            lines = Seq(
+              s"Matched rows:            $matchedRowCount",
+              s"Extra rows in actual:    0",
+              s"Missing rows in actual:  0"
+            )
+          )
+
+          println("Business-key matching... OK")
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Exact-match comparison
+        // ---------------------------------------------------------------------
+
+        println("Exact-match comparison...")
+
+        if (failFast) {
+
+          val exactMismatchCondition =
+            exactMatchCols
+              .map { column =>
+                !(col(actColumn(column)) <=> col(expColumn(column)))
+              }
+              .reduceOption(_ || _)
+              .getOrElse(lit(false))
+
+          val firstMismatch =
+            matchedRows
+              .filter(exactMismatchCondition)
+              .orderBy(
+                businessKeyCols.map(c => col(actColumn(c))): _*
+              )
+              .limit(1)
+              .collect()
+              .headOption
+
+          firstMismatch match {
+
+            case Some(row) =>
+
+              sections += ReportSection(
+                title = "Exact-match comparison",
+                status = Failed,
+                lines =
+                  Seq(
+                    "First mismatching row:",
+                    ""
+                  ) ++
+                    formatJoinedRowDiff(
+                      row = row,
+                      columns = relevantCols
+                    )
+              )
+
+              sections += notExecutedSection("Float/Double comparison")
+
+              val report =
+                DataFrameAssertionReport(
+                  configuration = configuration,
+                  sections = sections.toSeq
+                )
+
+              printReport(report)
+
+              assert(
+                assertion = false,
+                message = "Exact-match comparison failed"
+              )
+
+            case None =>
+
+              sections += ReportSection(
+                title = "Exact-match comparison",
+                status = Passed,
+                lines = Seq(
+                  s"Rows checked: $matchedRowCount",
+                  s"Columns checked: ${formatSeq(exactMatchCols)}"
+                )
+              )
+
+              println("Exact-match comparison... OK")
+          }
+
+        } else {
+
+          val exactLines =
+            ArrayBuffer[String](
+              s"Rows checked: $matchedRowCount"
+            )
+
+          var exactFailed =
+            false
+
+          exactMatchCols.foreach { column =>
+
+            val mismatches =
+              matchedRows.filter(
+                !(col(actColumn(column)) <=> col(expColumn(column)))
+              )
+
+            val mismatchCount =
+              mismatches.count()
+
+            if (mismatchCount > 0) {
+              exactFailed = true
+            }
+
+            exactLines +=
+              s"$column: $mismatchCount mismatches"
+
+            if (mismatchCount > 0) {
+
+              exactLines +=
+                s"First ${math.min(mismatchCount, MaxReportedMismatches)} mismatches:"
+
+              exactLines ++=
+                formatJoinedDiffRows(
+                  df = mismatches,
+                  columns = relevantCols,
+                  limit = MaxReportedMismatches
+                )
+
+              if (mismatchCount > MaxReportedMismatches) {
+                exactLines +=
+                  s"... ${mismatchCount - MaxReportedMismatches} additional mismatches not shown"
+              }
+            }
+          }
+
+          sections += ReportSection(
+            title = "Exact-match comparison",
+            status = if (exactFailed) Failed else Passed,
+            lines = exactLines.toSeq
+          )
+
+          println(
+            if (exactFailed)
+              "Exact-match comparison... FAILED"
+            else
+              "Exact-match comparison... OK"
+          )
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Float/Double comparison
+        // ---------------------------------------------------------------------
+
+        println("Float/Double comparison...")
+
+        if (failFast) {
+
+          val firstFloatMismatch =
+            findFirstFloatMismatch(
+              matchedRows = matchedRows,
+              businessKeyCols = businessKeyCols,
+              floatComparisons = floatComparisons
+            )
+
+          firstFloatMismatch match {
+
+            case Some((column, comparison, row)) =>
+
+              sections += ReportSection(
+                title = "Float/Double comparison",
+                status = Failed,
+                lines =
+                  Seq(
+                    s"First mismatching column: $column",
+                    s"Comparison: $comparison",
+                    "",
+                    "First mismatching row:",
+                    ""
+                  ) ++
+                    formatJoinedRowDiff(
+                      row = row,
+                      columns = relevantCols
+                    )
+              )
+
+              val report =
+                DataFrameAssertionReport(
+                  configuration = configuration,
+                  sections = sections.toSeq
+                )
+
+              printReport(report)
+
+              assert(
+                assertion = false,
+                message =
+                  s"Float/Double comparison failed for column '$column'"
+              )
+
+            case None =>
+
+              sections += ReportSection(
+                title = "Float/Double comparison",
+                status = Passed,
+                lines = Seq(
+                  s"Rows checked: $matchedRowCount",
+                  "Float comparisons:",
+                  formatFloatComparisonsMultiline(floatComparisons)
+                )
+              )
+
+              println("Float/Double comparison... OK")
+          }
+
+        } else {
+
+          val floatLines =
+            ArrayBuffer[String](
+              s"Rows checked: $matchedRowCount"
+            )
+
+          var floatFailed =
+            false
+
+          floatComparisons.foreach {
+            case (column, comparison) =>
+
+              val mismatches =
+                filterFloatMismatches(
+                  df = matchedRows,
+                  columnName = column,
+                  comparison = comparison
+                )
+
+              val mismatchCount =
+                mismatches.count()
+
+              if (mismatchCount > 0) {
+                floatFailed = true
+              }
+
+              floatLines +=
+                s"$column [$comparison]: $mismatchCount mismatches"
+
+              if (mismatchCount > 0) {
+
+                floatLines +=
+                  s"First ${math.min(mismatchCount, MaxReportedMismatches)} mismatches:"
+
+                floatLines ++=
+                  formatJoinedDiffRows(
+                    df = mismatches,
+                    columns = relevantCols,
+                    limit = MaxReportedMismatches
+                  )
+
+                if (mismatchCount > MaxReportedMismatches) {
+                  floatLines +=
+                    s"... ${mismatchCount - MaxReportedMismatches} additional mismatches not shown"
+                }
               }
           }
 
-        sections += ReportSection(
-          title = "Business-key matching",
-          status = Failed,
-          lines =
-            Seq(
-              s"Matched rows:            $matchedRowCount",
-              s"Extra rows in actual:    $extraInActualCount",
-              s"Missing rows in actual:  $missingInActualCount",
-              ""
-            ) ++ detailLines
-        )
+          sections += ReportSection(
+            title = "Float/Double comparison",
+            status = if (floatFailed) Failed else Passed,
+            lines = floatLines.toSeq
+          )
 
-        sections += notExecutedSection("Exact-match comparison")
-        sections += notExecutedSection("Float/Double comparison")
+          println(
+            if (floatFailed)
+              "Float/Double comparison... FAILED"
+            else
+              "Float/Double comparison... OK"
+          )
+        }
+
+
+        // ---------------------------------------------------------------------
+        // Final report
+        // ---------------------------------------------------------------------
 
         val report =
           DataFrameAssertionReport(
@@ -703,363 +1096,20 @@ object DataFrameAssertions {
         printReport(report)
 
         assert(
-          assertion = false,
-          message = "Business-key matching failed"
-        )
-      }
-
-      val lines =
-        ArrayBuffer[String](
-          s"Matched rows:            $matchedRowCount",
-          s"Extra rows in actual:    $extraInActualCount",
-          s"Missing rows in actual:  $missingInActualCount"
+          assertion = report.passed,
+          message = "DataFrame comparison failed"
         )
 
-      if (extraInActualCount > 0) {
+      } finally {
 
-        lines += ""
-        lines +=
-          s"First ${math.min(extraInActualCount, MaxReportedMismatches)} extra rows in actual:"
-
-        lines ++=
-          formatJoinedRows(
-            df = extraRowsInActual,
-            actualSide = true,
-            sourceLabel = "ACTUAL",
-            columns = relevantCols,
-            limit = MaxReportedMismatches
-          )
-
-        if (extraInActualCount > MaxReportedMismatches) {
-          lines +=
-            s"... ${extraInActualCount - MaxReportedMismatches} additional rows not shown"
-        }
+        joined.unpersist()
       }
 
-      if (missingInActualCount > 0) {
+    } finally {
 
-        lines += ""
-        lines +=
-          s"First ${math.min(missingInActualCount, MaxReportedMismatches)} missing rows in actual:"
-
-        lines ++=
-          formatJoinedRows(
-            df = missingRowsInActual,
-            actualSide = false,
-            sourceLabel = "EXPECTED",
-            columns = relevantCols,
-            limit = MaxReportedMismatches
-          )
-
-        if (missingInActualCount > MaxReportedMismatches) {
-          lines +=
-            s"... ${missingInActualCount - MaxReportedMismatches} additional rows not shown"
-        }
-      }
-
-      sections += ReportSection(
-        title = "Business-key matching",
-        status = Failed,
-        lines = lines.toSeq
-      )
-
-      println("Business-key matching... FAILED")
-
-    } else {
-
-      sections += ReportSection(
-        title = "Business-key matching",
-        status = Passed,
-        lines = Seq(
-          s"Matched rows:            $matchedRowCount",
-          s"Extra rows in actual:    0",
-          s"Missing rows in actual:  0"
-        )
-      )
-
-      println("Business-key matching... OK")
+      relevantAct.unpersist()
+      relevantExp.unpersist()
     }
-
-
-    // -------------------------------------------------------------------------
-    // Exact-match comparison
-    // -------------------------------------------------------------------------
-
-    println("Exact-match comparison...")
-
-    if (failFast) {
-
-      val exactMismatchCondition =
-        exactMatchCols
-          .map { column =>
-            !(col(actColumn(column)) <=> col(expColumn(column)))
-          }
-          .reduceOption(_ || _)
-          .getOrElse(lit(false))
-
-      val firstMismatch =
-        matchedRows
-          .filter(exactMismatchCondition)
-          .orderBy(
-            businessKeyCols.map(c => col(actColumn(c))): _*
-          )
-          .limit(1)
-          .collect()
-          .headOption
-
-      firstMismatch match {
-
-        case Some(row) =>
-
-          sections += ReportSection(
-            title = "Exact-match comparison",
-            status = Failed,
-            lines =
-              Seq(
-                "First mismatching row:",
-                ""
-              ) ++
-                formatJoinedRowDiff(
-                  row = row,
-                  columns = relevantCols
-                )
-          )
-
-          sections += notExecutedSection("Float/Double comparison")
-
-          val report =
-            DataFrameAssertionReport(
-              configuration = configuration,
-              sections = sections.toSeq
-            )
-
-          printReport(report)
-
-          assert(
-            assertion = false,
-            message = "Exact-match comparison failed"
-          )
-
-        case None =>
-
-          sections += ReportSection(
-            title = "Exact-match comparison",
-            status = Passed,
-            lines = Seq(
-              s"Rows checked: $matchedRowCount",
-              s"Columns checked: ${formatSeq(exactMatchCols)}"
-            )
-          )
-
-          println("Exact-match comparison... OK")
-      }
-
-    } else {
-
-      val exactLines =
-        ArrayBuffer[String](
-          s"Rows checked: $matchedRowCount"
-        )
-
-      var exactFailed =
-        false
-
-      exactMatchCols.foreach { column =>
-
-        val mismatches =
-          matchedRows.filter(
-            !(col(actColumn(column)) <=> col(expColumn(column)))
-          )
-
-        val mismatchCount =
-          mismatches.count()
-
-        if (mismatchCount > 0) {
-          exactFailed = true
-        }
-
-        exactLines +=
-          s"$column: $mismatchCount mismatches"
-
-        if (mismatchCount > 0) {
-
-          exactLines +=
-            s"First ${math.min(mismatchCount, MaxReportedMismatches)} mismatches:"
-
-          exactLines ++=
-            formatJoinedDiffRows(
-              df = mismatches,
-              columns = relevantCols,
-              limit = MaxReportedMismatches
-            )
-
-          if (mismatchCount > MaxReportedMismatches) {
-            exactLines +=
-              s"... ${mismatchCount - MaxReportedMismatches} additional mismatches not shown"
-          }
-        }
-      }
-
-      sections += ReportSection(
-        title = "Exact-match comparison",
-        status = if (exactFailed) Failed else Passed,
-        lines = exactLines.toSeq
-      )
-
-      println(
-        if (exactFailed)
-          "Exact-match comparison... FAILED"
-        else
-          "Exact-match comparison... OK"
-      )
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Float/Double comparison
-    // -------------------------------------------------------------------------
-
-    println("Float/Double comparison...")
-
-    if (failFast) {
-
-      val firstFloatMismatch =
-        findFirstFloatMismatch(
-          matchedRows = matchedRows,
-          businessKeyCols = businessKeyCols,
-          floatComparisons = floatComparisons
-        )
-
-      firstFloatMismatch match {
-
-        case Some((column, comparison, row)) =>
-
-          sections += ReportSection(
-            title = "Float/Double comparison",
-            status = Failed,
-            lines =
-              Seq(
-                s"First mismatching column: $column",
-                s"Comparison: $comparison",
-                "",
-                "First mismatching row:",
-                ""
-              ) ++
-                formatJoinedRowDiff(
-                  row = row,
-                  columns = relevantCols
-                )
-          )
-
-          val report =
-            DataFrameAssertionReport(
-              configuration = configuration,
-              sections = sections.toSeq
-            )
-
-          printReport(report)
-
-          assert(
-            assertion = false,
-            message =
-              s"Float/Double comparison failed for column '$column'"
-          )
-
-        case None =>
-
-          sections += ReportSection(
-            title = "Float/Double comparison",
-            status = Passed,
-            lines = Seq(
-              s"Rows checked: $matchedRowCount",
-              "Float comparisons:",
-              formatFloatComparisonsMultiline(floatComparisons)
-            )
-          )
-
-          println("Float/Double comparison... OK")
-      }
-
-    } else {
-
-      val floatLines =
-        ArrayBuffer[String](
-          s"Rows checked: $matchedRowCount"
-        )
-
-      var floatFailed =
-        false
-
-      floatComparisons.foreach {
-        case (column, comparison) =>
-
-          val mismatches =
-            filterFloatMismatches(
-              df = matchedRows,
-              columnName = column,
-              comparison = comparison
-            )
-
-          val mismatchCount =
-            mismatches.count()
-
-          if (mismatchCount > 0) {
-            floatFailed = true
-          }
-
-          floatLines +=
-            s"$column [$comparison]: $mismatchCount mismatches"
-
-          if (mismatchCount > 0) {
-
-            floatLines +=
-              s"First ${math.min(mismatchCount, MaxReportedMismatches)} mismatches:"
-
-            floatLines ++=
-              formatJoinedDiffRows(
-                df = mismatches,
-                columns = relevantCols,
-                limit = MaxReportedMismatches
-              )
-
-            if (mismatchCount > MaxReportedMismatches) {
-              floatLines +=
-                s"... ${mismatchCount - MaxReportedMismatches} additional mismatches not shown"
-            }
-          }
-      }
-
-      sections += ReportSection(
-        title = "Float/Double comparison",
-        status = if (floatFailed) Failed else Passed,
-        lines = floatLines.toSeq
-      )
-
-      println(
-        if (floatFailed)
-          "Float/Double comparison... FAILED"
-        else
-          "Float/Double comparison... OK"
-      )
-    }
-
-
-    // -------------------------------------------------------------------------
-    // Final report
-    // -------------------------------------------------------------------------
-
-    val report =
-      DataFrameAssertionReport(
-        configuration = configuration,
-        sections = sections.toSeq
-      )
-
-    printReport(report)
-
-    assert(
-      assertion = report.passed,
-      message = "DataFrame comparison failed"
-    )
   }
 
 
@@ -1405,7 +1455,7 @@ object DataFrameAssertions {
 
     val actLine =
       (
-        "ACTUAL" +:
+        "ACT" +:
           columns.map { column =>
             formatCsvValue(
               actRow.getAs[Any](column)
@@ -1415,7 +1465,7 @@ object DataFrameAssertions {
 
     val expLine =
       (
-        "EXPECTED" +:
+        "EXP" +:
           columns.map { column =>
             formatCsvValue(
               expRow.getAs[Any](column)
@@ -1456,8 +1506,8 @@ object DataFrameAssertions {
 
     Seq(
       header,
-      ("ACTUAL" +: actualValues).mkString(","),
-      ("EXPECTED" +: expectedValues).mkString(",")
+      ("ACT" +: actualValues).mkString(","),
+      ("EXP" +: expectedValues).mkString(",")
     )
   }
 
@@ -1583,11 +1633,11 @@ object DataFrameAssertions {
           }
 
         lines +=
-          ("ACTUAL" +: actualValues)
+          ("ACT" +: actualValues)
             .mkString(",")
 
         lines +=
-          ("EXPECTED" +: expectedValues)
+          ("EXP" +: expectedValues)
             .mkString(",")
       }
 
