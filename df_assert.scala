@@ -1392,14 +1392,16 @@ object DataFrameAssertions {
     )
   }
 
-
   private def findFirstFloatMismatch(
       matchedRows: DataFrame,
       businessKeyCols: Seq[String],
       floatComparisons: Map[String, FloatComparison]
   ): Option[(String, FloatComparison, Row)] = {
 
-    floatComparisons.iterator
+    floatComparisons
+      .toSeq
+      .sortBy(_._1)
+      .iterator
       .map {
         case (column, comparison) =>
 
@@ -1428,7 +1430,6 @@ object DataFrameAssertions {
         case Some(value) => value
       }
   }
-
 
   // ===========================================================================
   // CSV-like row formatting
